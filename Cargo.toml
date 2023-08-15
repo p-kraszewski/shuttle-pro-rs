@@ -12,6 +12,8 @@ windows = { version = "^0.48", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_Graphics_Gdi",
@@ -19,12 +21,9 @@ windows = { version = "^0.48", features = [
     "Win32_UI_WindowsAndMessaging",
     "Foundation",
     "Devices_HumanInterfaceDevice",
+    "Data_Xml_Dom",
+    "UI_Notifications"
 ] }
 
 windows-targets = { version = "^0.48" }
-vlc-rs = "0.3"
-lazy_static = "1.4"
-#color-eyre = "^0.6"
-
-[dev-dependencies]
-#windows-bindgen = { version = "^0.48" }
+winrt-notification = "0.5.1"

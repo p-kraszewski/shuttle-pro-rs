@@ -1,27 +1,29 @@
-use lazy_static::lazy_static;
-use std::{mem, slice, sync};
+#![windows_subsystem = "windows"]
 
-use windows::core::*;
+use std::cmp::min;
+use std::mem;
+
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_OEM_4, VK_OEM_6, VK_OEM_PLUS, VK_SPACE,
+};
 use windows::Win32::UI::Input::{
     GetRawInputData, GetRawInputDeviceInfoA, RegisterRawInputDevices, HRAWINPUT, RAWINPUT,
     RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDI_DEVICENAME, RID_INPUT,
+};
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconA, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NOTIFYICONDATAA,
 };
 use windows::{
     core::*, Win32::Foundation::*, Win32::Graphics::Gdi::ValidateRect,
     Win32::System::LibraryLoader::GetModuleHandleA, Win32::UI::WindowsAndMessaging::*,
 };
+use winrt_notification::{Duration, Sound, Toast};
 
-use shuttle_pro_rs::hid;
+const APPWM_ICONNOTIFY: u32 = WM_APP + 1;
 
 union RawInputWrapper {
     ri: RAWINPUT,
-    data: [u8; 1024],
-}
-
-impl RawInputWrapper {
-    fn parse_hid(&self) -> Vec<Vec<u8>> {
-        Vec::new()
-    }
+    _data: [u8; 1024],
 }
 
 #[repr(C)]
@@ -35,8 +37,9 @@ struct ContourHidEvent {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-struct ContourHid {
+struct SystemState {
     last: ContourHidEvent,
+    scroll_zoom: u8,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -48,7 +51,13 @@ enum ContourEvents {
     ButtonDown(u16),
 }
 
-impl ContourHid {
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Scroll {
+    Left(u8),
+    Right(u8),
+}
+
+impl SystemState {
     fn update(&mut self, new: ContourHidEvent) -> Vec<ContourEvents> {
         let mut evt = Vec::new();
         if self.last.id != 0 {
@@ -95,20 +104,22 @@ impl ContourHid {
 
 const CONTOUR_ID: &str = r#"\\?\hid#vid_0b33&pid_0030#"#;
 
-static mut PLAYER: Option<vlc::MediaPlayer> = None;
+fn main() {
+    match xmain() {
+        Ok(()) => {}
+        Err(msg) => message("Error", msg.to_string().as_str()),
+    }
+}
 
-fn main() -> Result<()> {
-    let dev = hid::find_hid_decvice(0x0b33, 0x0030)?;
-    println!("DEV={}", dev);
-
+fn xmain() -> Result<()> {
     let instance = unsafe { GetModuleHandleA(None) }?;
     debug_assert!(instance.0 != 0);
 
-    let window_class = s!("window");
+    let window_class = s!("contour_control_window");
 
     let wc = WNDCLASSA {
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
-        hInstance: instance.into(),
+        hInstance: instance,
         lpszClassName: window_class,
 
         style: CS_HREDRAW | CS_VREDRAW,
@@ -123,8 +134,8 @@ fn main() -> Result<()> {
         CreateWindowExA(
             WINDOW_EX_STYLE::default(),
             window_class,
-            s!("This is a sample window"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            s!("Contour Controller"),
+            WS_OVERLAPPEDWINDOW, /*| WS_VISIBLE*/
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -147,22 +158,7 @@ fn main() -> Result<()> {
 
     let mut message = MSG::default();
 
-    // Create an instance
-    let instance = vlc::Instance::new().unwrap();
-    // Create a media from a file
-    let md = vlc::Media::new_path(
-        &instance,
-        r#"E:\VLC\Introducing Rain - Free Blender rig.mkv"#,
-    )
-    .unwrap();
-    // Create a media player
-    let mdp = vlc::MediaPlayer::new(&instance).unwrap();
-    mdp.set_media(&md);
-    mdp.play();
-    unsafe { PLAYER = Some(mdp) };
-
-    // Start playing
-    // mdp.play().unwrap();
+    register_icon(wnd);
 
     while unsafe { GetMessageA(&mut message, None, 0, 0) }.into() {
         unsafe { DispatchMessageA(&message) };
@@ -171,7 +167,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-static mut OLD_KEYS: ContourHid = ContourHid {
+static mut GLOBAL_STATE: SystemState = SystemState {
+    scroll_zoom: 0,
     last: ContourHidEvent {
         id: 0xFF,
         jog: 0,
@@ -193,6 +190,19 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
+
+        APPWM_ICONNOTIFY => match lparam.0 as u32 {
+            WM_LBUTTONUP => {
+                println!("WM_NOTIFY WM_LBUTTONUP");
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            }
+
+            _ => {
+                println!("WM_NOTIFY OTHER");
+                LRESULT(0)
+            }
+        },
 
         WM_INPUT => {
             //  println!("WM_INPUT");
@@ -226,46 +236,7 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
             }
             let devn = String::from_utf8_lossy(&name[..rc as usize]).to_lowercase();
             if devn.starts_with(CONTOUR_ID) && unsafe { data.ri.data.hid.dwSizeHid == 6 } {
-                let hiddata =
-                    unsafe { *(data.ri.data.hid.bRawData.as_ptr() as *const ContourHidEvent) };
-                println!("HID: {:X?}/{}", hiddata, unsafe {
-                    data.ri.data.hid.dwCount
-                });
-                let mut P = unsafe { (PLAYER.as_ref()) }.unwrap();
-                let evts = unsafe { OLD_KEYS.update(hiddata) };
-                println!("EVT={:?}", &evts);
-                for evt in evts {
-                    match evt {
-                        ContourEvents::Jog(x) => {
-                            let refrate = 2.0_f32;
-                            let rate = refrate.powf(x as f32 / 2.0);
-                            P.set_rate(rate);
-                            println!("Playback rate {}/{}", x, rate);
-                        }
-                        ContourEvents::WheelLeft => {
-                            if let Some(pos) = P.get_time() {
-                                if pos > 1000 {
-                                    P.set_time(pos - 1000);
-                                } else {
-                                    P.set_time(0)
-                                }
-                            }
-                        }
-                        ContourEvents::WheelRight => {
-                            if let Some(pos) = P.get_time() {
-                                P.set_time(pos + 1000);
-                            }
-                        }
-                        ContourEvents::ButtonUp(b) => match b {
-                            6 => P.set_pause(P.is_playing()),
-                            _ => (),
-                        },
-                        ContourEvents::ButtonDown(_) => {}
-                    }
-                }
-                // if hiddata.keys&0x0001 !=0{
-                //     P.set_pause(P.is_playing());
-                // }
+                process_contour_event(&mut data);
             } else {
                 println!("OtherDev");
             }
@@ -276,15 +247,127 @@ extern "system" fn wndproc(window: HWND, message: u32, wparam: WPARAM, lparam: L
     }
 }
 
-fn send_msg(cmd: u32) {
+fn process_contour_event(data: &mut RawInputWrapper) {
+    let hiddata = unsafe { *(data.ri.data.hid.bRawData.as_ptr() as *const ContourHidEvent) };
+    println!("HID: {:X?}/{}", hiddata, unsafe {
+        data.ri.data.hid.dwCount
+    });
+    // let mut P = unsafe { (PLAYER.as_ref()) }.unwrap();
+    let evts = unsafe { GLOBAL_STATE.update(hiddata) };
+
+    println!("EVT={:?}", &evts);
+    for evt in evts {
+        match evt {
+            ContourEvents::Jog(x) => {
+                if x < 0 {
+                    send_key(VK_OEM_4); // [
+                }
+                if x > 0 {
+                    send_key(VK_OEM_6); // ]
+                }
+            }
+            ContourEvents::WheelLeft => {
+                let zoom = unsafe { GLOBAL_STATE.scroll_zoom };
+                send_h_wheel(Scroll::Left(1 << zoom));
+            }
+            ContourEvents::WheelRight => {
+                let zoom = unsafe { GLOBAL_STATE.scroll_zoom };
+                send_h_wheel(Scroll::Right(1 << zoom));
+            }
+            ContourEvents::ButtonUp(b) => match b {
+                0..=3 => unsafe {
+                    GLOBAL_STATE.scroll_zoom = b as u8;
+                    message("Info", format!("Scroll speed {}", 1 << b).as_str());
+                },
+                6 => send_key(VK_SPACE),
+                13 | 14 => {
+                    send_key(VK_OEM_PLUS);
+                    message("Info", "Playback speed normal");
+                }
+                _ => {}
+            },
+            ContourEvents::ButtonDown(_) => {}
+        }
+    }
+}
+
+fn send_key(key: VIRTUAL_KEY) {
     let vlc = unsafe { FindWindowA(s!("Qt5QWindowIcon"), None) };
-    //let vlc = unsafe{FindWindowA(s!("SkinWindowClass"), None)};
 
     if vlc.0 > 0 {
-        //println!("Found VLC");
-        let rc = unsafe { SendMessageA(vlc, WM_COMMAND, WPARAM(cmd as usize), None) };
-        println!("Found VLC, rc={}", rc.0);
+        println!("Found VLC, sending {:?}", key);
+
+        unsafe { PostMessageA(vlc, WM_KEYDOWN, WPARAM(key.0 as usize), LPARAM(1)) };
+
+        unsafe {
+            PostMessageA(
+                vlc,
+                WM_KEYUP,
+                WPARAM(key.0 as usize),
+                LPARAM(1 | 1 << 30 | 1 << 31),
+            )
+        };
     } else {
         println!("No VLC");
     }
+}
+
+fn send_h_wheel(scroll: Scroll) {
+    let vlc = unsafe { FindWindowA(s!("Qt5QWindowIcon"), None) };
+
+    if vlc.0 > 0 {
+        println!("Found VLC, sending mouse {:?}", scroll);
+
+        let (dir, steps) = match scroll {
+            Scroll::Left(n) => (-1, n),
+            Scroll::Right(n) => (1, n),
+        };
+        let ev = (dir as u16 as usize) << 16;
+        for _ in 0..steps {
+            unsafe { PostMessageA(vlc, WM_MOUSEHWHEEL, WPARAM(ev), LPARAM(0)) };
+        }
+    } else {
+        println!("No VLC");
+    }
+}
+
+fn register_icon(hwnd: HWND) {
+    let icon = unsafe { LoadIconA(None, PCSTR(IDI_INFORMATION as *const u8)).unwrap() };
+    let mut nid = NOTIFYICONDATAA {
+        cbSize: mem::size_of::<NOTIFYICONDATAA>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_ICON | NIF_TIP | NIF_MESSAGE,
+        uCallbackMessage: APPWM_ICONNOTIFY,
+        hIcon: icon,
+        szTip: [0; 128],
+        dwState: Default::default(),
+        dwStateMask: 0,
+        szInfo: [0; 256],
+        Anonymous: Default::default(),
+        szInfoTitle: [0; 64],
+        dwInfoFlags: Default::default(),
+        guidItem: Default::default(),
+        hBalloonIcon: Default::default(),
+    };
+
+    fill_slice(nid.szTip.as_mut_slice(), "Contour Control");
+
+    unsafe { Shell_NotifyIconA(NIM_ADD, &nid) };
+}
+
+fn fill_slice(s: &mut [u8], data: &str) {
+    let data = data.as_bytes();
+    let len = min(data.len(), s.len());
+    s[..len].copy_from_slice(&data[..len]);
+}
+
+fn message(title: &str, text: &str) {
+    Toast::new(Toast::POWERSHELL_APP_ID)
+        .title(title)
+        .text1(text)
+        .sound(Some(Sound::SMS))
+        .duration(Duration::Short)
+        .show()
+        .expect("unable to toast");
 }
